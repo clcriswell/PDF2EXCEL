@@ -1,135 +1,119 @@
 import streamlit as st
-import json
 import pandas as pd
-from io import BytesIO
-from google.cloud import vision_v1
+import tempfile
+import os
 from google.oauth2 import service_account
-from google.cloud import storage
-import time
-import uuid
-import re
+from google.cloud import vision
+from PyPDF2 import PdfReader
 
-# --- CONFIG ---
-BUCKET_NAME = "pdf2excel-app-bucket"
-
-# --- AUTH ---
-creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+# ---- Google Cloud Vision Setup ----
+creds_dict = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
 credentials = service_account.Credentials.from_service_account_info(creds_dict)
-vision_client = vision_v1.ImageAnnotatorClient(credentials=credentials)
-storage_client = storage.Client(credentials=credentials)
+client = vision.ImageAnnotatorClient(credentials=credentials)
 
-st.set_page_config(page_title="AI PDF Semantic Extractor", layout="centered")
-st.title("📄 AI-Smart PDF to Excel")
+# ---- Smart Line Classifier ----
+def classify_line(line, next_line=""):
+    line = line.strip()
+    result = {
+        "Section": "",
+        "Type": "Unclassified",
+        "Confidence": "Low",
+        "Name": "",
+        "Title": "",
+        "Organization": "",
+        "Original": line
+    }
 
-uploaded_file = st.file_uploader("Upload any PDF (scanned or structured)", type="pdf")
+    if line.isupper() or (line.istitle() and ":" not in line and not line.startswith("•") and len(line.split()) > 2):
+        result["Type"] = "Section Header"
+        result["Confidence"] = "High"
+        return result
 
-def upload_to_bucket(bucket_name, file_data, destination_blob_name):
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(destination_blob_name)
-    blob.upload_from_file(file_data, content_type="application/pdf")
-    return f"gs://{bucket_name}/{destination_blob_name}"
+    if ":" in line and not line.startswith("•"):
+        parts = line.split(":", 1)
+        if len(parts) == 2 and len(parts[1].strip()) > 1:
+            result["Type"] = "Award Recipient"
+            result["Confidence"] = "High"
+            result["Title"] = parts[0].strip()
+            result["Name"] = parts[1].strip()
+            return result
 
-def run_ocr(pdf_gcs_uri, output_uri):
-    feature = vision_v1.Feature(type_=vision_v1.Feature.Type.DOCUMENT_TEXT_DETECTION)
-    gcs_source = vision_v1.GcsSource(uri=pdf_gcs_uri)
-    input_config = vision_v1.InputConfig(gcs_source=gcs_source, mime_type="application/pdf")
-    gcs_destination = vision_v1.GcsDestination(uri=output_uri)
-    output_config = vision_v1.OutputConfig(gcs_destination=gcs_destination, batch_size=1)
-    request = vision_v1.AsyncAnnotateFileRequest(
-        features=[feature],
-        input_config=input_config,
-        output_config=output_config,
-    )
-    operation = vision_client.async_batch_annotate_files(requests=[request])
-    operation.result(timeout=120)
-    return True
+    if line.startswith("•") and "," in line:
+        name_title = line.lstrip("• ").strip()
+        name, title = [part.strip() for part in name_title.split(",", 1)]
+        result["Name"] = name
+        result["Title"] = title
+        if next_line and not next_line.startswith("•") and len(next_line.split()) > 1:
+            result["Organization"] = next_line.strip()
+            result["Type"] = "Board Member"
+            result["Confidence"] = "High"
+        else:
+            result["Type"] = "Leadership Role"
+            result["Confidence"] = "Medium"
+        return result
 
-def read_ocr_output(bucket_name, prefix):
-    bucket = storage_client.bucket(bucket_name)
-    blobs = list(storage_client.bucket(bucket_name).list_blobs(prefix=prefix))
-    full_text = ""
-    for blob in blobs:
-        if blob.name.endswith(".json"):
-            json_data = json.loads(blob.download_as_text())
-            for resp in json_data.get("responses", []):
-                full_text += resp.get("fullTextAnnotation", {}).get("text", "") + "\n"
-    return full_text
+    if "," in line and len(line.split()) <= 8:
+        parts = line.split(",", 1)
+        if len(parts) == 2:
+            result["Name"] = parts[0].strip()
+            result["Organization"] = parts[1].strip()
+            result["Type"] = "Name + Organization"
+            result["Confidence"] = "Medium"
+            return result
 
-def smart_extract_lines(text):
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    structured = []
-    section = None
+    if "@" in line or "email:" in line.lower():
+        result["Type"] = "Contact Info"
+        result["Confidence"] = "High"
+        return result
 
-    for i, line in enumerate(lines):
-        # Detect possible section headers
-        if re.match(r'^[A-Z0-9].*(\d{4})?.*$', line) and ":" not in line and not line.startswith("•") and not line.endswith("."):
-            section = line
-            continue
+    if any(word in line.lower() for word in ["address", "street", "city", "zip"]):
+        result["Type"] = "Address Block"
+        result["Confidence"] = "Medium"
+        return result
 
-        # Detect award-like structure
-        if re.match(r'^•?\s?[^:]{3,40}:\s?.{2,}', line):
-            match = re.search(r'^•?\s?(.*?):\s+(.*)', line)
-            if match:
-                title, recipient = match.groups()
-                structured.append({
-                    "Section": section,
-                    "Type": "Award or Role",
-                    "Title": title.strip(),
-                    "Name/Value": recipient.strip(),
-                    "Original": line
-                })
-                continue
+    if len(line.split()) > 10:
+        result["Type"] = "Narrative Message"
+        result["Confidence"] = "Medium"
 
-        # Detect name + org structure (2-line pattern)
-        if line.startswith("•") and "," in line:
-            name_title = line.lstrip("• ").strip()
-            name, title = [part.strip() for part in name_title.split(",", 1)]
-            org = lines[i + 1] if i + 1 < len(lines) and not lines[i + 1].startswith("•") else ""
-            structured.append({
-                "Section": section,
-                "Type": "Leadership",
-                "Name": name,
-                "Title": title,
-                "Organization": org.strip(),
-                "Original": name_title + " / " + org
-            })
+    return result
 
-        # Detect name, org on single line
-        elif "," in line and re.match(r'^[A-Z][a-z]+\s[A-Z][a-z]+,', line):
-            parts = line.split(",", 1)
-            structured.append({
-                "Section": section,
-                "Type": "Name + Org",
-                "Name": parts[0].strip(),
-                "Organization": parts[1].strip(),
-                "Original": line
-            })
+# ---- OCR Function ----
+def extract_text_from_pdf(uploaded_file):
+    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_pdf.write(uploaded_file.read())
+    temp_pdf.close()
 
-    return pd.DataFrame(structured) if structured else pd.DataFrame({"Extracted Text": lines})
+    reader = PdfReader(temp_pdf.name)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n"
+
+    os.unlink(temp_pdf.name)
+    return text
+
+# ---- Streamlit UI ----
+st.title("🧠 Smart PDF-to-Excel Converter")
+
+uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 
 if uploaded_file:
-    uid = str(uuid.uuid4())
-    blob_name = f"uploads/{uid}.pdf"
-    output_prefix = f"ocr_results/{uid}/"
-    output_uri = f"gs://{BUCKET_NAME}/{output_prefix}"
+    st.info("🔍 Extracting and analyzing text...")
 
-    st.info("🧠 Processing with semantic extraction...")
-    upload_to_bucket(BUCKET_NAME, uploaded_file, blob_name)
-    run_ocr(f"gs://{BUCKET_NAME}/{blob_name}", output_uri)
-    time.sleep(10)
+    raw_text = extract_text_from_pdf(uploaded_file)
+    lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
+    structured = []
 
-    ocr_text = read_ocr_output(BUCKET_NAME, output_prefix)
-    df = smart_extract_lines(ocr_text)
+    for i, line in enumerate(lines):
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        structured.append(classify_line(line, next_line))
 
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name="Smart Data")
-    output.seek(0)
+    df = pd.DataFrame(structured)
 
-    st.success("✅ Done! Download your smart-extracted Excel below.")
+    st.success("✅ Conversion complete!")
+    st.dataframe(df)
+
     st.download_button(
-        label="📥 Download Smart Excel",
-        data=output,
-        file_name="semantic_parsed.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        label="📥 Download Excel File",
+        data=df.to_excel(index=False, engine="openpyxl"),
+        file_name="converted_output.xlsx"
     )
