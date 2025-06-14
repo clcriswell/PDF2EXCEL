@@ -1,7 +1,5 @@
 streamlit
 pandas
-pdfplumber
-pdf2image
-pytesseract
 openpyxl
 google-cloud-vision
+google-cloud-storage
