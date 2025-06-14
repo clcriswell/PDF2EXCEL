@@ -1,6 +1,5 @@
 streamlit
-pdfplumber
 pandas
 openpyxl
-pdf2image
 google-cloud-vision
+google-cloud-storage
