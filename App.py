@@ -1,67 +1,104 @@
 import streamlit as st
-import pdfplumber
+import json
 import pandas as pd
 from io import BytesIO
-from pdf2image import convert_from_bytes
+from google.cloud import vision_v1
 from google.oauth2 import service_account
-from google.cloud import vision
-import json
+from google.cloud import storage
+import time
+import uuid
 
-st.set_page_config(page_title="PDF to Excel (with OCR)", layout="centered")
-st.title("📄 PDF to Excel Converter with OCR")
-st.write("Upload a PDF (even scanned or image-based) and download a converted Excel file.")
+# --- CONFIG ---
+BUCKET_NAME = "pdf2excel-app-bucket"
 
-# Load credentials from Streamlit secrets
+# --- AUTH ---
 creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
 credentials = service_account.Credentials.from_service_account_info(creds_dict)
-vision_client = vision.ImageAnnotatorClient(credentials=credentials)
 
-uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+vision_client = vision_v1.ImageAnnotatorClient(credentials=credentials)
+storage_client = storage.Client(credentials=credentials)
 
-def extract_text_from_image(image):
-    buffered = BytesIO()
-    image.save(buffered, format="JPEG")
-    content = buffered.getvalue()
-    image = vision.Image(content=content)
-    response = vision_client.document_text_detection(image=image)
-    return response.full_text_annotation.text if response.full_text_annotation.text else ""
+# --- UI ---
+st.set_page_config(page_title="PDF to Excel OCR", layout="centered")
+st.title("📄 PDF to Excel (with Google OCR)")
+uploaded_file = st.file_uploader("Upload a scanned PDF", type="pdf")
 
-if uploaded_file:
-    output = BytesIO()
-    all_texts = []
-    found_tables = False
+# --- Function: Upload to GCS ---
+def upload_to_bucket(bucket_name, file_data, destination_blob_name):
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(destination_blob_name)
+    blob.upload_from_file(file_data, content_type="application/pdf")
+    return f"gs://{bucket_name}/{destination_blob_name}"
 
-    try:
-        with pdfplumber.open(uploaded_file) as pdf:
-            for page_num, page in enumerate(pdf.pages, start=1):
-                tables = page.extract_tables()
-                for table_num, table in enumerate(tables, start=1):
-                    if table and any(any(cell for cell in row) for row in table):
-                        df = pd.DataFrame(table)
-                        all_texts.append((f"Page_{page_num}_Table_{table_num}", df))
-                        found_tables = True
-    except Exception:
-        st.warning("⚠️ Could not open PDF with pdfplumber — falling back to OCR only.")
+# --- Function: OCR request ---
+def run_ocr(pdf_gcs_uri, output_uri):
+    mime_type = "application/pdf"
+    feature = vision_v1.Feature(type_=vision_v1.Feature.Type.DOCUMENT_TEXT_DETECTION)
+    gcs_source = vision_v1.GcsSource(uri=pdf_gcs_uri)
+    input_config = vision_v1.InputConfig(gcs_source=gcs_source, mime_type=mime_type)
+    gcs_destination = vision_v1.GcsDestination(uri=output_uri)
+    output_config = vision_v1.OutputConfig(gcs_destination=gcs_destination, batch_size=1)
 
-    if not found_tables:
-        st.info("🔍 No extractable tables found — using OCR to read scanned pages...")
-        images = convert_from_bytes(uploaded_file.read())
-        text_blocks = []
-        for i, image in enumerate(images):
-            ocr_text = extract_text_from_image(image)
-            text_blocks.append([ocr_text])
-        df = pd.DataFrame(text_blocks, columns=["Extracted Text"])
-        all_texts = [("OCR_Extracted_Text", df)]
-
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        for sheet_name, df in all_texts:
-            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-
-    output.seek(0)
-    st.success("✅ Conversion complete!")
-    st.download_button(
-        label="📥 Download Excel File",
-        data=output,
-        file_name="converted_output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    async_request = vision_v1.AsyncAnnotateFileRequest(
+        features=[feature],
+        input_config=input_config,
+        output_config=output_config,
     )
+
+    operation = vision_client.async_batch_annotate_files(requests=[async_request])
+    st.info("🕒 OCR processing… This may take 10–20 seconds.")
+    operation.result(timeout=120)
+    st.success("✅ OCR completed.")
+    return True
+
+# --- Function: Read OCR Results ---
+def read_ocr_output(bucket_name, prefix):
+    bucket = storage_client.bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    text_output = []
+
+    for blob in blobs:
+        if blob.name.endswith('.json'):
+            json_data = json.loads(blob.download_as_text())
+            responses = json_data.get("responses", [])
+            for resp in responses:
+                full_text = resp.get("fullTextAnnotation", {}).get("text", "")
+                if full_text.strip():
+                    text_output.append(full_text.strip())
+
+    return text_output
+
+# --- Run OCR Pipeline ---
+if uploaded_file:
+    uid = str(uuid.uuid4())
+    blob_name = f"uploads/{uid}.pdf"
+    output_prefix = f"ocr_results/{uid}/"
+    output_uri = f"gs://{BUCKET_NAME}/{output_prefix}"
+
+    # Upload PDF to GCS
+    upload_to_bucket(BUCKET_NAME, uploaded_file, blob_name)
+
+    # Submit OCR request
+    run_ocr(f"gs://{BUCKET_NAME}/{blob_name}", output_uri)
+
+    # Wait for files to finalize in GCS
+    time.sleep(10)
+
+    # Read OCR results
+    extracted_pages = read_ocr_output(BUCKET_NAME, output_prefix)
+
+    if extracted_pages:
+        df = pd.DataFrame({"Extracted Text": extracted_pages})
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name="Extracted Text")
+        output.seek(0)
+
+        st.download_button(
+            label="📥 Download Excel File",
+            data=output,
+            file_name="ocr_output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.warning("⚠️ No text was extracted from the file.")
