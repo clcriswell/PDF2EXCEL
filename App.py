@@ -1,115 +1,135 @@
 import streamlit as st
-import pandas as pd
-import pdfplumber
-import re
-import io
-from google.oauth2 import service_account
-from google.cloud import vision
 import json
-from pdf2image import convert_from_bytes
-import pytesseract
+import pandas as pd
+from io import BytesIO
+from google.cloud import vision_v1
+from google.oauth2 import service_account
+from google.cloud import storage
+import time
+import uuid
+import re
 
-# Authenticate with Google Vision API
+# --- CONFIG ---
+BUCKET_NAME = "pdf2excel-app-bucket"
+
+# --- AUTH ---
 creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
 credentials = service_account.Credentials.from_service_account_info(creds_dict)
-client = vision.ImageAnnotatorClient(credentials=credentials)
+vision_client = vision_v1.ImageAnnotatorClient(credentials=credentials)
+storage_client = storage.Client(credentials=credentials)
 
-st.set_page_config(page_title="PDF/Text to Excel Converter", layout="centered")
-st.title("📄 Smart PDF & Text to Excel Converter")
+st.set_page_config(page_title="AI PDF Semantic Extractor", layout="centered")
+st.title("📄 AI-Smart PDF to Excel")
 
-uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
-pasted_text = st.text_area("Or paste your text list here", height=200)
+uploaded_file = st.file_uploader("Upload any PDF (scanned or structured)", type="pdf")
 
-def extract_text_from_image(pdf_file):
-    images = convert_from_bytes(pdf_file.read())
-    extracted_text = ""
-    for img in images:
-        text = pytesseract.image_to_string(img)
-        extracted_text += text + "\n"
-    return extracted_text
+def upload_to_bucket(bucket_name, file_data, destination_blob_name):
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(destination_blob_name)
+    blob.upload_from_file(file_data, content_type="application/pdf")
+    return f"gs://{bucket_name}/{destination_blob_name}"
 
-def detect_table(pdf_file):
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
-            for page in pdf.pages:
-                if page.extract_table():
-                    return True
-    except:
-        pass
-    return False
+def run_ocr(pdf_gcs_uri, output_uri):
+    feature = vision_v1.Feature(type_=vision_v1.Feature.Type.DOCUMENT_TEXT_DETECTION)
+    gcs_source = vision_v1.GcsSource(uri=pdf_gcs_uri)
+    input_config = vision_v1.InputConfig(gcs_source=gcs_source, mime_type="application/pdf")
+    gcs_destination = vision_v1.GcsDestination(uri=output_uri)
+    output_config = vision_v1.OutputConfig(gcs_destination=gcs_destination, batch_size=1)
+    request = vision_v1.AsyncAnnotateFileRequest(
+        features=[feature],
+        input_config=input_config,
+        output_config=output_config,
+    )
+    operation = vision_client.async_batch_annotate_files(requests=[request])
+    operation.result(timeout=120)
+    return True
 
-def parse_award_style_text(text):
-    rows = []
+def read_ocr_output(bucket_name, prefix):
+    bucket = storage_client.bucket(bucket_name)
+    blobs = list(storage_client.bucket(bucket_name).list_blobs(prefix=prefix))
+    full_text = ""
+    for blob in blobs:
+        if blob.name.endswith(".json"):
+            json_data = json.loads(blob.download_as_text())
+            for resp in json_data.get("responses", []):
+                full_text += resp.get("fullTextAnnotation", {}).get("text", "") + "\n"
+    return full_text
+
+def smart_extract_lines(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    structured = []
     section = None
-    lines = text.strip().splitlines()
 
-    for line in lines:
-        line = line.strip()
-        if not line:
+    for i, line in enumerate(lines):
+        # Detect possible section headers
+        if re.match(r'^[A-Z0-9].*(\d{4})?.*$', line) and ":" not in line and not line.startswith("•") and not line.endswith("."):
+            section = line
             continue
 
-        # Section headers like: Community Awards:
-        if re.match(r".+:\s*$", line):
-            section = line[:-1]
-        elif "•" in line:
-            current = line.replace("•", "").strip()
-            next_line = lines[lines.index(line)+1].strip() if lines.index(line)+1 < len(lines) else ""
-            if "," in current:
-                name, title = map(str.strip, current.split(",", 1))
-                org = next_line if next_line and next_line != line else ""
-                rows.append([section, title, name, org])
-        elif ":" in line and not line.endswith(":"):
-            title, name = map(str.strip, line.split(":", 1))
-            rows.append([section, title, name, ""])
-    return pd.DataFrame(rows, columns=["Section", "Title", "Recipient", "Organization"])
+        # Detect award-like structure
+        if re.match(r'^•?\s?[^:]{3,40}:\s?.{2,}', line):
+            match = re.search(r'^•?\s?(.*?):\s+(.*)', line)
+            if match:
+                title, recipient = match.groups()
+                structured.append({
+                    "Section": section,
+                    "Type": "Award or Role",
+                    "Title": title.strip(),
+                    "Name/Value": recipient.strip(),
+                    "Original": line
+                })
+                continue
 
-def parse_plain_text(text):
-    rows = []
-    for line in text.strip().splitlines():
-        if "•" in line and "," in line:
-            try:
-                part = line.replace("•", "").strip()
-                name, title = map(str.strip, part.split(",", 1))
-                rows.append([name, title])
-            except:
-                rows.append([line.strip(), ""])
-        elif ":" in line:
-            try:
-                title, name = map(str.strip, line.split(":", 1))
-                rows.append([name, title])
-            except:
-                rows.append([line.strip(), ""])
-        else:
-            rows.append([line.strip(), ""])
-    return pd.DataFrame(rows, columns=["Name/Line", "Title/Notes"])
+        # Detect name + org structure (2-line pattern)
+        if line.startswith("•") and "," in line:
+            name_title = line.lstrip("• ").strip()
+            name, title = [part.strip() for part in name_title.split(",", 1)]
+            org = lines[i + 1] if i + 1 < len(lines) and not lines[i + 1].startswith("•") else ""
+            structured.append({
+                "Section": section,
+                "Type": "Leadership",
+                "Name": name,
+                "Title": title,
+                "Organization": org.strip(),
+                "Original": name_title + " / " + org
+            })
 
-def parse_table_pdf(file):
-    file.seek(0)
-    with pdfplumber.open(io.BytesIO(file.read())) as pdf:
-        dfs = [pd.DataFrame(page.extract_table()[1:], columns=page.extract_table()[0]) for page in pdf.pages if page.extract_table()]
-        return pd.concat(dfs) if dfs else pd.DataFrame()
+        # Detect name, org on single line
+        elif "," in line and re.match(r'^[A-Z][a-z]+\s[A-Z][a-z]+,', line):
+            parts = line.split(",", 1)
+            structured.append({
+                "Section": section,
+                "Type": "Name + Org",
+                "Name": parts[0].strip(),
+                "Organization": parts[1].strip(),
+                "Original": line
+            })
+
+    return pd.DataFrame(structured) if structured else pd.DataFrame({"Extracted Text": lines})
 
 if uploaded_file:
-    st.info("Processing uploaded PDF...")
-    if detect_table(uploaded_file):
-        uploaded_file.seek(0)
-        df = parse_table_pdf(uploaded_file)
-    else:
-        uploaded_file.seek(0)
-        text = extract_text_from_image(uploaded_file)
-        df = parse_award_style_text(text) if ":" in text or "•" in text else parse_plain_text(text)
+    uid = str(uuid.uuid4())
+    blob_name = f"uploads/{uid}.pdf"
+    output_prefix = f"ocr_results/{uid}/"
+    output_uri = f"gs://{BUCKET_NAME}/{output_prefix}"
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
-    st.success("✅ Done! Download your Excel file below.")
-    st.download_button("⬇️ Download Excel", output.getvalue(), file_name="converted_output.xlsx")
+    st.info("🧠 Processing with semantic extraction...")
+    upload_to_bucket(BUCKET_NAME, uploaded_file, blob_name)
+    run_ocr(f"gs://{BUCKET_NAME}/{blob_name}", output_uri)
+    time.sleep(10)
 
-elif pasted_text:
-    st.info("Processing pasted text...")
-    df = parse_award_style_text(pasted_text) if ":" in pasted_text or "•" in pasted_text else parse_plain_text(pasted_text)
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
-    st.success("✅ Done! Download your Excel file below.")
-    st.download_button("⬇️ Download Excel", output.getvalue(), file_name="converted_text_output.xlsx")
+    ocr_text = read_ocr_output(BUCKET_NAME, output_prefix)
+    df = smart_extract_lines(ocr_text)
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name="Smart Data")
+    output.seek(0)
+
+    st.success("✅ Done! Download your smart-extracted Excel below.")
+    st.download_button(
+        label="📥 Download Smart Excel",
+        data=output,
+        file_name="semantic_parsed.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
