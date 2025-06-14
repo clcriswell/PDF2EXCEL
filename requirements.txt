@@ -1,5 +1,6 @@
 streamlit
 pandas
 openpyxl
+PyPDF2
 google-cloud-vision
-google-cloud-storage
+google-auth
