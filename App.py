@@ -7,11 +7,11 @@ from google.oauth2 import service_account
 from google.cloud import vision
 from PyPDF2 import PdfReader
 
-# ✅ This is all you need
-creds_dict = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+# ✅ Load credentials correctly
+creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
 credentials = service_account.Credentials.from_service_account_info(creds_dict)
-
 client = vision.ImageAnnotatorClient(credentials=credentials)
+
 
 
 # ---- Smart Line Classifier ----
