@@ -1,16 +1,29 @@
 import streamlit as st
-import pandas as pd
 import json
-import tempfile
-import os
 from google.oauth2 import service_account
 from google.cloud import vision
-from PyPDF2 import PdfReader
 
-# ✅ Load credentials correctly
-creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+# Pull credentials from secrets and convert to dict
+creds_dict = {
+    "type": st.secrets["GCP_SERVICE_ACCOUNT"]["type"],
+    "project_id": st.secrets["GCP_SERVICE_ACCOUNT"]["project_id"],
+    "private_key_id": st.secrets["GCP_SERVICE_ACCOUNT"]["private_key_id"],
+    "private_key": st.secrets["GCP_SERVICE_ACCOUNT"]["private_key"],
+    "client_email": st.secrets["GCP_SERVICE_ACCOUNT"]["client_email"],
+    "client_id": st.secrets["GCP_SERVICE_ACCOUNT"]["client_id"],
+    "auth_uri": st.secrets["GCP_SERVICE_ACCOUNT"]["auth_uri"],
+    "token_uri": st.secrets["GCP_SERVICE_ACCOUNT"]["token_uri"],
+    "auth_provider_x509_cert_url": st.secrets["GCP_SERVICE_ACCOUNT"]["auth_provider_x509_cert_url"],
+    "client_x509_cert_url": st.secrets["GCP_SERVICE_ACCOUNT"]["client_x509_cert_url"],
+    "universe_domain": st.secrets["GCP_SERVICE_ACCOUNT"]["universe_domain"]
+}
+
+# Load credentials
 credentials = service_account.Credentials.from_service_account_info(creds_dict)
+
+# Create Vision API client
 client = vision.ImageAnnotatorClient(credentials=credentials)
+
 
 
 
