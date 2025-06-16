@@ -133,8 +133,14 @@ if uploaded_file:
     st.success("✅ Conversion complete!")
     st.dataframe(df)
 
+    import io
+    excel_buffer = io.BytesIO()
+    df.to_excel(excel_buffer, index=False, engine="openpyxl")
+    excel_buffer.seek(0)
+
     st.download_button(
         label="📥 Download Excel File",
-        data=df.to_excel(index=False, engine="openpyxl"),
-        file_name="converted_output.xlsx"
+        data=excel_buffer,
+        file_name="converted_output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
