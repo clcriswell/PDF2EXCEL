@@ -1,7 +1,12 @@
 import streamlit as st
+import pandas as pd
 import json
+import os
+import tempfile  # Required for handling temporary files
 from google.oauth2 import service_account
 from google.cloud import vision
+from PyPDF2 import PdfReader
+
 
 # Pull credentials from secrets and convert to dict
 creds_dict = {
