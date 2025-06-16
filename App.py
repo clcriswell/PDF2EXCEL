@@ -1,10 +1,12 @@
 import streamlit as st
 import pandas as pd
+import json  # ✅ Add this line
 import tempfile
 import os
 from google.oauth2 import service_account
 from google.cloud import vision
 from PyPDF2 import PdfReader
+
 
 # ---- Google Cloud Vision Setup ----
 creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
