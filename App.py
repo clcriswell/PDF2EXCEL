@@ -7,7 +7,7 @@ from google.cloud import vision
 from PyPDF2 import PdfReader
 
 # ---- Google Cloud Vision Setup ----
-creds_dict = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
 credentials = service_account.Credentials.from_service_account_info(creds_dict)
 client = vision.ImageAnnotatorClient(credentials=credentials)
 
