@@ -1,17 +1,18 @@
 import streamlit as st
 import pandas as pd
-import json  # ✅ Add this line
+import json
 import tempfile
 import os
 from google.oauth2 import service_account
 from google.cloud import vision
 from PyPDF2 import PdfReader
 
-
-# ---- Google Cloud Vision Setup ----
+# ✅ This is all you need
 creds_dict = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
 credentials = service_account.Credentials.from_service_account_info(creds_dict)
+
 client = vision.ImageAnnotatorClient(credentials=credentials)
+
 
 # ---- Smart Line Classifier ----
 def classify_line(line, next_line=""):
